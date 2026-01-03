@@ -11,13 +11,11 @@ from scipy.spatial.transform import Rotation as R
 import joblib
 import warnings
 
-# --- TensorFlow and Keras Imports ---
 import tensorflow as tf
 from tensorflow.keras.utils import pad_sequences
 from tensorflow.keras import backend as K
 
 
-# --- Setup ---
 warnings.filterwarnings('ignore')
 tf.get_logger().setLevel('ERROR')
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -30,9 +28,6 @@ class CFG:
     ARTIFACT_DIR = Path("/kaggle/input/0-825-fix-model-cmi")
 
 
-print("--- Loading models and artifacts... ---")
-
-# --- Load Models ---
 models = []
 for fold in range(CFG.N_SPLITS):
     model_path = CFG.ARTIFACT_DIR / f"gesture_model_fold_{fold}.h5"
@@ -43,14 +38,11 @@ for fold in range(CFG.N_SPLITS):
     }
     model = tf.keras.models.load_model(model_path, custom_objects=custom_objects, compile=False)
     models.append(model)
-print(f"Loaded {len(models)} models.")
 
-# --- Load Scalers ---
 sequence_scalers = [joblib.load(CFG.ARTIFACT_DIR / f"sequence_scaler_{fold}.pkl") for fold in range(CFG.N_SPLITS)]
 static_scalers = [joblib.load(CFG.ARTIFACT_DIR / f"static_scaler_{fold}.pkl") for fold in range(CFG.N_SPLITS)]
 tabular_scalers = [joblib.load(CFG.ARTIFACT_DIR / f"tabular_scaler_{fold}.pkl") for fold in range(CFG.N_SPLITS)]
 
-# --- Load Other Artifacts ---
 pad_len = np.load(CFG.ARTIFACT_DIR / "sequence_maxlen.npy").item()
 gesture_classes = np.load(CFG.ARTIFACT_DIR / "gesture_classes.npy", allow_pickle=True)
 final_feature_cols = np.load(CFG.ARTIFACT_DIR / "feature_cols.npy", allow_pickle=True)
@@ -58,12 +50,6 @@ static_feature_cols = np.load(CFG.ARTIFACT_DIR / "static_feature_cols.npy", allo
 tabular_feature_cols = np.load(CFG.ARTIFACT_DIR / "tabular_feature_cols.npy", allow_pickle=True)
 imu_agg_cols = np.load(CFG.ARTIFACT_DIR / "imu_agg_cols.npy", allow_pickle=True)
 
-
-print("--- Artifact loading complete. Server is ready. ---")
-
-# ===================================================================================
-# 1. FEATURE ENGINEERING HELPERS
-# ===================================================================================
 def remove_gravity_from_acc(acc_data, rot_data):
     acc_values = acc_data[['acc_x', 'acc_y', 'acc_z']].values
     quat_values = rot_data[['rot_x', 'rot_y', 'rot_z', 'rot_w']].values
@@ -123,16 +109,12 @@ def calculate_angular_distance(rot_data):
         except (ValueError, IndexError): pass
     return angular_dist
 
-
 def get_fft_features(sequence_data, n_features):
     if len(sequence_data) < n_features * 2: return np.zeros(n_features)
     fft_vals = np.fft.fft(sequence_data)
     fft_mag = np.abs(fft_vals)[:len(fft_vals)//2]
     return fft_mag[1:n_features+1]
 
-# ===================================================================================
-# 2. FULL FEATURE ENGINEERING FUNCTION
-# ===================================================================================
 def engineer_features(df):
     """Applies all feature engineering steps from training."""
     df[['linear_acc_x', 'linear_acc_y', 'linear_acc_z']] = remove_gravity_from_acc(df, df)
@@ -164,26 +146,19 @@ def engineer_features(df):
     
     return df
 
-# ===================================================================================
-# 3. PREDICTION FUNCTION (This is called for each sequence)
-# ===================================================================================
+
 def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
-    # --- 3.1. Data Preparation ---
+   
     sequence_df = sequence.to_pandas()
     demographics_df = demographics.to_pandas()
     df = pd.merge(sequence_df, demographics_df, on='subject', how='left')
 
-    # --- 3.2. Validation of Raw Inputs ---
     required_raw_cols = {'acc_x', 'acc_y', 'acc_z', 'rot_x', 'rot_y', 'rot_z', 'rot_w'}
     missing_cols = required_raw_cols - set(df.columns)
     if missing_cols:
         raise ValueError(f"Input data is missing essential raw columns: {missing_cols}")
 
-    # --- 3.3. Feature Engineering ---
     df_featured = engineer_features(df.copy())
-
-    # --- 3.4. Create Model Inputs (Unscaled) ---
-    # Sequence Input
     X_seq_unscaled = df_featured[final_feature_cols].ffill().bfill().fillna(0).values.astype('float32')
     
     # Static Input
@@ -204,13 +179,9 @@ def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
         aggs[f'{col}_min'] = imu_agg_df[col].min()
         aggs[f'{col}_quantile'] = imu_agg_df[col].quantile(0.5) # Matches training .agg(['quantile'])
         
-    # Convert dict to a single-row DataFrame and fill any potential NaNs
     aggs_df = pd.DataFrame([aggs]).fillna(0)
-    
-    # Select the columns in the exact order from training to create the final numpy array.
     X_tabular_unscaled = aggs_df[tabular_feature_cols].values.astype('float32')
-    
-    # --- 3.5. Ensemble Predictions ---
+
     all_preds = []
     for fold in range(CFG.N_SPLITS):
         X_seq_scaled = sequence_scalers[fold].transform(X_seq_unscaled)
@@ -228,7 +199,6 @@ def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
         pred = models[fold].predict(inputs, verbose=0)['main_output']
         all_preds.append(pred)
 
-    # --- 3.6. Finalize Prediction ---
     avg_preds = np.mean(all_preds, axis=0)
     pred_idx = np.argmax(avg_preds)
     gesture_name = gesture_classes[pred_idx]
