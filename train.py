@@ -25,14 +25,11 @@ from utils import (
     build_monster_branch_model
 )
 
-# --- Setup ---
 warnings.filterwarnings('ignore')
 tf.get_logger().setLevel('ERROR')
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 pd.options.mode.chained_assignment = None 
 
-
-# --- Configuration ---
 class CFG:
     TRAIN = True
     BASE_DIR = Path("/kaggle/input/cmi-detect-behavior-with-sensor-data") 
@@ -58,22 +55,17 @@ def seed_everything(seed):
 
 
 if CFG.TRAIN:
-    print("---------- TRAINING MODE ---------")
-    # --- Load Data ---
+
     train_df = pd.read_csv(CFG.BASE_DIR / "train.csv")
     train_dem_df = pd.read_csv(CFG.BASE_DIR / "train_demographics.csv")
     df = pd.merge(train_df, train_dem_df, on='subject', how='left')
     print(f"Initial training data shape: {df.shape}")
     
-    # --- Label Encoding ---
+
     le = LabelEncoder(); df['gesture_int'] = le.fit_transform(df['gesture'])
     np.save(CFG.EXPORT_DIR / "gesture_classes.npy", le.classes_)
     bfrb_gestures = [c for c in le.classes_ if ' - ' in c and not any(k in c for k in ['Wave', 'Text', 'Write', 'Feel', 'Scratch knee', 'Pull air', 'Drink', 'Glasses', 'Pinch knee'])]
 
-    # =================================================================
-    # 1. PER-TIMESTEP FEATURE ENGINEERING
-    # =================================================================
-    print("Performing per-timestep feature engineering...")
     df_list = []
     for _, group in tqdm(df.groupby('sequence_id'), desc="Processing Sequences"):
         group[['linear_acc_x', 'linear_acc_y', 'linear_acc_z']] = remove_gravity_from_acc(group, group)
@@ -109,12 +101,6 @@ if CFG.TRAIN:
     df['angular_vel_mag_jerk'] = df.groupby('sequence_id')['angular_vel_mag'].diff().fillna(0)
     df['gesture_rhythm_signature'] = df.groupby('sequence_id')['linear_acc_mag'].transform(lambda x: x.rolling(5, min_periods=1).std() / (x.rolling(5, min_periods=1).mean() + 1e-6))
 
-    # =================================================================
-    # 2. DEFINE AND ORDER FEATURE COLUMNS FOR THE MODEL
-    # =================================================================
-    print("Defining and ordering feature columns for the model...")
-    
-    # IMU Features (carefully ordered to match model slicing)
     acc_cols = ['linear_acc_x', 'linear_acc_y', 'linear_acc_z']
     gyro_cols = ['angular_vel_x', 'angular_vel_y', 'angular_vel_z']
     other_imu_cols = [
@@ -134,9 +120,7 @@ if CFG.TRAIN:
     imu_dim = len(imu_cols); thm_dim = len(thm_cols); tof_dim = len(tof_agg_cols)
     print(f"Sequence Dims: IMU={imu_dim} | THM={thm_dim} | TOF={tof_dim} | Total={len(final_feature_cols)}")
 
-    # =================================================================
-    # 3. CREATE STATIC AND TABULAR (AGGREGATE) FEATURES
-    # =================================================================
+
     print("Creating static (FFT) and tabular (aggregate) features...")
     df_meta = df.groupby('sequence_id').first().reset_index()
     
@@ -163,9 +147,6 @@ if CFG.TRAIN:
     static_dim = len(static_feature_cols); tabular_dim = len(tabular_feature_cols)
     print(f"Static/Tabular Dims: Static={static_dim}, Tabular={tabular_dim}")
 
-    # =================================================================
-    # 4. ASSEMBLE FINAL MODEL INPUTS (NUMPY ARRAYS)
-    # =================================================================
     print("Assembling final model inputs...")
     X_seq_raw, X_static_raw, X_tabular_raw, y_raw, groups_raw, lens_raw = [], [], [], [], [], []
     
@@ -186,23 +167,19 @@ if CFG.TRAIN:
 
     pad_len = int(np.percentile(lens_raw, CFG.PAD_PERCENTILE))
     print(f"Global pad length set to: {pad_len}")
-
-    # =================================================================
-    # 5. CROSS-VALIDATION AND TRAINING LOOP
-    # =================================================================
+    
     sgkf = StratifiedGroupKFold(n_splits=CFG.N_SPLITS, shuffle=True, random_state=CFG.SEED)
     for fold, (train_idx, val_idx) in enumerate(sgkf.split(X_seq_raw, y_raw, groups_raw)):
         print(f"\n{'='*50}\nFOLD {fold+1}/{CFG.N_SPLITS}")
         seed_everything(CFG.SEED + fold)
         
-        # --- Split Data ---
+    
         X_train_seq_unpadded, X_val_seq_unpadded = X_seq_raw[train_idx], X_seq_raw[val_idx]
         X_train_static_unscaled, X_val_static_unscaled = X_static_raw[train_idx], X_static_raw[val_idx]
         X_train_tabular_unscaled, X_val_tabular_unscaled = X_tabular_raw[train_idx], X_tabular_raw[val_idx]
         y_train_cat, y_val_cat = y_cat_raw[train_idx], y_cat_raw[val_idx]
         y_val_gestures = le.classes_[np.array(y_raw)[val_idx]]
-        
-        # --- Scaling ---
+
         print("  Fitting fold-specific scalers...")
         sequence_scaler = IMUSpecificScaler().fit(np.concatenate(X_train_seq_unpadded, axis=0), imu_dim)
         static_scaler = StandardScaler().fit(X_train_static_unscaled)
@@ -213,11 +190,10 @@ if CFG.TRAIN:
         X_train_static = static_scaler.transform(X_train_static_unscaled); X_val_static = static_scaler.transform(X_val_static_unscaled)
         X_train_tabular = tabular_scaler.transform(X_train_tabular_unscaled); X_val_tabular = tabular_scaler.transform(X_val_tabular_unscaled)
         
-        # --- Padding ---
+
         X_train = pad_sequences(X_train_seq_scaled, maxlen=pad_len, padding='post', dtype='float32')
         X_val = pad_sequences(X_val_seq_scaled, maxlen=pad_len, padding='post', dtype='float32')
         
-        # --- Model Build and Compile ---
         K.clear_session()
         model = build_monster_branch_model(
             pad_len=pad_len, 
@@ -238,8 +214,6 @@ if CFG.TRAIN:
             loss_weights={'main_output': 1.0, 'tof_gate': CFG.GATE_LOSS_WEIGHT}
         )
         
-        # --- Data Generator ---
-        # NOTE: You MUST update your GatedMixupGenerator to accept a 3-element tuple for X
         class_weights = compute_class_weight('balanced', classes=np.arange(len(le.classes_)), y=y_train_cat.argmax(1))
         train_gen = GatedMixupGenerator(
             (X_train, X_train_static, X_train_tabular), # Tuple of 3 inputs
@@ -253,7 +227,6 @@ if CFG.TRAIN:
             'tabular_input': X_val_tabular
         }
 
-        # --- Callbacks and Training ---
         callbacks = [
             EnhancedCMIMetricCallback(val_inputs, y_val_gestures, le.classes_, bfrb_gestures, imu_dim, patience=CFG.PATIENCE),
             SWA(start_epoch=CFG.SWA_START_EPOCH)
@@ -268,7 +241,6 @@ if CFG.TRAIN:
             verbose=0
         ) 
 
-        # --- Save Artifacts ---
         if fold == 0:
             print("\n  Saving artifacts from Fold 1 for inference...")
             np.save(CFG.EXPORT_DIR / "sequence_maxlen.npy", np.array([pad_len]))
