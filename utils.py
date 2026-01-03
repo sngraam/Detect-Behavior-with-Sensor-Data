@@ -8,7 +8,6 @@ from sklearn.metrics import f1_score
 from sklearn.preprocessing import StandardScaler
 from scipy.spatial.transform import Rotation as R
 
-
 def remove_gravity_from_acc(acc_data, rot_data):
     acc_values = acc_data[['acc_x', 'acc_y', 'acc_z']].values
     quat_values = rot_data[['rot_x', 'rot_y', 'rot_z', 'rot_w']].values
@@ -101,11 +100,13 @@ def focal_loss(gamma=2.0, alpha=0.75):
 
 class IMUSpecificScaler:
     def __init__(self): self.imu_scaler = StandardScaler(); self.tof_scaler = StandardScaler(); self.imu_dim = None
+    
     def fit(self, X, imu_dim):
         self.imu_dim = imu_dim; tof_thm_data = X[:, imu_dim:]
         valid_tof_thm_mask = np.any(tof_thm_data != 0, axis=1)
         if np.sum(valid_tof_thm_mask) > 0: self.tof_scaler.fit(tof_thm_data[valid_tof_thm_mask])
         self.imu_scaler.fit(X[:, :imu_dim]); return self
+    
     def transform(self, X):
         X_imu = self.imu_scaler.transform(X[:, :self.imu_dim]); X_tof_thm = X[:, self.imu_dim:].copy()
         transform_mask = np.any(X_tof_thm != 0, axis=1)
@@ -113,23 +114,10 @@ class IMUSpecificScaler:
         return np.concatenate([X_imu, X_tof_thm], axis=1)
 
 def evaluate_dual_cmi_metric(model, val_inputs, y_val_gestures, gesture_classes, bfrb_gestures, imu_dim):
-    """
-    Evaluates the model on both full-sensor and IMU-only data.
-    
-    Args:
-        model: The trained Keras model.
-        val_inputs (dict): A dictionary of validation numpy arrays matching the model's input names.
-        y_val_gestures (np.array): The ground truth gesture strings for the validation set.
-        ... (other parameters)
-    """
-    # --- Full Sensor Score ---
-    # The val_inputs dictionary is passed directly to the predict function
     full_preds_idx = model.predict(val_inputs, verbose=0, batch_size=256)['main_output'].argmax(axis=1)
     full_gestures = gesture_classes[full_preds_idx]
     full_sensor_score, full_marco = calculate_competition_metric(y_val_gestures, full_gestures, bfrb_gestures)
 
-    # --- IMU-Only Score ---
-    # Create a copy of the inputs to modify for the IMU-only prediction
     imu_inputs = {key: arr.copy() for key, arr in val_inputs.items()}
     # Zero out the ToF/Thermopile features in the sequence input
     imu_inputs['sequence_input'][:, :, imu_dim:] = 0.0
@@ -154,7 +142,7 @@ class EnhancedCMIMetricCallback(tf.keras.callbacks.Callback):
     """
     def __init__(self, val_inputs, y_val_gestures, gesture_classes, bfrb_gestures, imu_dim, patience=40, verbose=1):
         super().__init__()
-        # <-- Accepts a single dictionary of all validation inputs
+
         self.val_inputs = val_inputs 
         self.y_val_gestures = y_val_gestures
         self.gesture_classes = gesture_classes
@@ -169,7 +157,7 @@ class EnhancedCMIMetricCallback(tf.keras.callbacks.Callback):
         self.best_weights = None
 
     def on_epoch_end(self, epoch, logs=None):
-        # <-- Pass the entire validation inputs dictionary to the evaluation function
+        
         dual_scores = evaluate_dual_cmi_metric(
             self.model, 
             self.val_inputs, 
@@ -206,32 +194,13 @@ class EnhancedCMIMetricCallback(tf.keras.callbacks.Callback):
         if self.verbose > 0:
             print(f"\nTraining ended. Best Composite Score: {self.best_composite_score:.4f} (Full: {self.best_full_sensor_score:.4f}, IMU: {self.best_imu_only_score:.4f})")
 
-import numpy as np
-import tensorflow as tf
+
 
 class GatedMixupGenerator(tf.keras.utils.Sequence):
-    """
-    A sophisticated data generator for Keras that handles:
-    1. Multi-input models (sequence, static, tabular, subject).
-    2. Gating mechanism for sensor data.
-    3. Sensor Dropout for regularization.
-    4. Mixup augmentation for continuous features.
-    5. Class weighting for imbalanced datasets.
-    """
+    import numpy as np
+    import tensorflow as tf
     def __init__(self, X, y, batch_size, imu_dim, class_weight=None, alpha=0.8, masking_prob=0.6, sensor_dropout_rate=0.02):
-        """
-        Initializes the generator.
-        
-        Args:
-            X (tuple): A tuple of numpy arrays (X_seq, X_static, X_tabular, X_subject).
-            y (np.array): The one-hot encoded labels.
-            batch_size (int): The size of each batch.
-            imu_dim (int): The number of IMU features in the sequence data.
-            class_weight (dict): A dictionary mapping class indices to their weights.
-            alpha (float): The alpha parameter for the Beta distribution in Mixup.
-            masking_prob (float): The probability of masking ToF/Thm sensors to train the gate.
-            sensor_dropout_rate (float): The probability of dropping full-sensor data as regularization.
-        """
+
         # Unpack the tuple of input arrays
         self.X_seq, self.X_static, self.X_tabular = X
         self.y = y
@@ -273,7 +242,6 @@ class GatedMixupGenerator(tf.keras.utils.Sequence):
         
         gate_target = np.ones(batch_size, dtype='float32')
         
-        # --- Stage 1: Augmentations (Masking & Sensor Dropout) ---
         for i in range(batch_size):
             # Apply `masking_prob` to train the gate on how to handle missing data
             if np.random.rand() < self.masking_prob:
@@ -285,7 +253,6 @@ class GatedMixupGenerator(tf.keras.utils.Sequence):
                 Xb_seq[i, :, self.imu_dim:] = 0
                 gate_target[i] = 0.0 # Gate target must also be zeroed
 
-        # --- Stage 2: Mixup ---
         if self.alpha > 0:
             # Get mixing coefficient and permutation indices
             lam = np.random.beta(self.alpha, self.alpha)
@@ -299,8 +266,6 @@ class GatedMixupGenerator(tf.keras.utils.Sequence):
             gate_target_mix = lam * gate_target + (1 - lam) * gate_target[perm_indices]
             sample_weights_mix = lam * sample_weights + (1 - lam) * sample_weights[perm_indices]
             
-            # ** CRITICAL: Do NOT mix up the discrete subject IDs. **
-            # We use the original subject IDs as the context for the mixed samples.
             inputs = {
                 'sequence_input': X_seq_mix, 
                 'static_input': X_static_mix, 
@@ -310,7 +275,6 @@ class GatedMixupGenerator(tf.keras.utils.Sequence):
             
             return inputs, outputs, sample_weights_mix
 
-        # --- Return if not using Mixup ---
         inputs = {
             'sequence_input': Xb_seq, 
             'static_input': Xb_static, 
@@ -326,12 +290,20 @@ class GatedMixupGenerator(tf.keras.utils.Sequence):
 
 class WarmupCosineDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
     def __init__(self, initial_learning_rate, decay_steps, warmup_steps, alpha=0.0):
-        super().__init__(); self.initial_learning_rate, self.decay_steps, self.warmup_steps, self.alpha = initial_learning_rate, decay_steps, warmup_steps, alpha
+        super().__init__(); self.initial_learning_rate, self.decay_steps, 
+        self.warmup_steps, self.alpha = initial_learning_rate, decay_steps, warmup_steps, alpha
         self.cosine_decay = tf.keras.optimizers.schedules.CosineDecay(initial_learning_rate, decay_steps - warmup_steps, alpha)
     def __call__(self, step):
         step_float = tf.cast(step, tf.float32)
         return tf.cond(step_float < self.warmup_steps, lambda: self.initial_learning_rate * (step_float / self.warmup_steps), lambda: self.cosine_decay(step_float - self.warmup_steps))
-    def get_config(self): return {"initial_learning_rate": self.initial_learning_rate, "decay_steps": self.decay_steps, "warmup_steps": self.warmup_steps, "alpha": self.alpha}
+    
+    def get_config(self): 
+        return {
+            "initial_learning_rate": self.initial_learning_rate, 
+            "decay_steps": self.decay_steps, 
+            "warmup_steps": self.warmup_steps, 
+            "alpha": self.alpha
+        }
 
 class SWA(tf.keras.callbacks.Callback):
     def __init__(self, start_epoch): super().__init__(); self.start_epoch, self.swa_weights, self.n_models = start_epoch, None, 0
