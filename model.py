@@ -122,8 +122,6 @@ def build_monster_branch_model(pad_len, imu_dim, thm_dim, tof_dim, static_dim, t
     tof_head = residual_se_cnn_block(tof_gated, 96, 3, drop=0.2, wd=wd)
     tof_head = residual_se_cnn_block(tof_head, 128, 5, drop=0.2, wd=wd)
 
-    # ========================== Thermopile BRANCH ==========================
-    # Thm data is simple (5 features), can be processed as one block
     thm_cnn = Conv1D(32, 3, padding='same', use_bias=False, kernel_regularizer=l2(wd))(thm)
     thm_cnn = BatchNormalization()(thm_cnn); thm_cnn = Activation('relu')(thm_cnn)
     thm_cnn = MaxPooling1D(2)(thm_cnn); thm_cnn = Dropout(0.2)(thm_cnn)
@@ -131,13 +129,9 @@ def build_monster_branch_model(pad_len, imu_dim, thm_dim, tof_dim, static_dim, t
     thm_head = residual_se_cnn_block(thm_cnn, 64, 3, drop=0.2, wd=wd)
     thm_head = residual_se_cnn_block(thm_head, 96, 5, drop=0.2, wd=wd)
 
-    # ======================= FEATURE FUSION & RNN HEAD =======================
-    # Static branch for demographics/FFT features
     static_branch = Dense(64, activation='relu')(static_inp)
     static_branch = Dense(32, activation='relu')(static_branch)
 
-    # Align dimensions after CNN pooling. All heads MUST have the same time steps.
-    # The residual_se_cnn_block performs pooling, so all heads have the same final length.
     target_time_steps = imu_head.shape[1]
     static_repeated = RepeatVector(target_time_steps)(static_branch)
 
@@ -151,7 +145,6 @@ def build_monster_branch_model(pad_len, imu_dim, thm_dim, tof_dim, static_dim, t
     # Attention to summarize RNN output into a single vector
     attention_vector = attention_layer(rnn_out, wd=wd)
     
-    # ======================= FINAL CLASSIFIER HEAD =======================
     # Tabular branch for aggregated features
     tabular_branch = Dense(128, activation='relu')(tabular_inp)
     tabular_branch = BatchNormalization()(tabular_branch)
